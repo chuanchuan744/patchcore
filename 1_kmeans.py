@@ -96,7 +96,7 @@ def run_patchcore_pipeline():
 
         return anomaly_map
 
-    def kmeans_anomaly_mask(anomaly_map, image_shape=None):
+    def kmeans_anomaly_outputs(anomaly_map, image_shape=None):
         anomaly_map = normalize_map(anomaly_map)
 
         if image_shape is not None:
@@ -105,27 +105,38 @@ def run_patchcore_pipeline():
 
         values = anomaly_map.reshape(-1, 1).astype(np.float32)
 
-        # n_init 不要太大，否则每张图都会比较吃 CPU
         kmeans = KMeans(
             n_clusters=2,
             random_state=0,
             n_init=3,
             max_iter=100,
         )
-
         labels = kmeans.fit_predict(values)
 
         centers = kmeans.cluster_centers_.reshape(-1)
         anomaly_cluster = int(np.argmax(centers))
+        normal_cluster = 1 - anomaly_cluster
 
-        mask = (labels.reshape(anomaly_map.shape) == anomaly_cluster).astype(np.uint8) * 255
+        labels_2d = labels.reshape(anomaly_map.shape)
+        mask = (labels_2d == anomaly_cluster).astype(np.uint8) * 255
 
-        # 后处理：去小噪声 + 平滑边界
+        anomaly_center = float(centers[anomaly_cluster])
+        normal_center = float(centers[normal_cluster])
+
+        dist_to_anomaly = np.abs(values - anomaly_center)
+        dist_to_normal = np.abs(values - normal_center)
+        kmeans_prob = dist_to_normal / (dist_to_anomaly + dist_to_normal + 1e-8)
+        kmeans_prob = kmeans_prob.reshape(anomaly_map.shape).astype(np.float32)
+
+        anomaly_map_01 = anomaly_map.astype(np.float32) / 255.0
+        refined_score = 0.6 * anomaly_map_01 + 0.4 * kmeans_prob
+        refined_score = cv2.GaussianBlur(refined_score, (3, 3), 0)
+
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        return mask
+        return mask, refined_score
 
     def read_gt_mask(image_path, dataset_root):
         rel_path = os.path.relpath(image_path, dataset_root)
@@ -173,7 +184,7 @@ def run_patchcore_pipeline():
 
         heatmap_overlay = cv2.addWeighted(image, 0.6, heatmap_color, 0.4, 0)
 
-        kmeans_mask = kmeans_anomaly_mask(anomaly_map, image_shape=image.shape)
+        kmeans_mask, kmeans_refined_score = kmeans_anomaly_outputs(anomaly_map, image_shape=image.shape)
 
         mask_color = np.zeros_like(image)
         mask_color[:, :, 0] = kmeans_mask
@@ -488,11 +499,11 @@ def run_patchcore_pipeline():
                     )
                     gt_mask = (gt_mask > 0).astype(np.uint8)
 
-                    kmeans_mask = kmeans_anomaly_mask(
+                    kmeans_mask, kmeans_refined_score = kmeans_anomaly_outputs(
                         anomaly_map,
                         image_shape=image_np.shape,
                     )
-                    kmeans_score = (kmeans_mask > 0).astype(np.float32)
+                    kmeans_score = kmeans_refined_score.astype(np.float32)
 
                     all_gt_masks.append(gt_mask.reshape(-1))
                     all_kmeans_scores.append(kmeans_score.reshape(-1))
